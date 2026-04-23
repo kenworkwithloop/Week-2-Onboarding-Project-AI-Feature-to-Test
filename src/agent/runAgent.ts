@@ -7,7 +7,6 @@ export interface AgentSuccess {
   ok: true;
   messages: ChatInputMessage[];
   output: AgentOutput;
-  /** Always returned with output: `{ message }` only. */
   chat: ChatOutput;
   toolCalls: ToolCall[];
 }

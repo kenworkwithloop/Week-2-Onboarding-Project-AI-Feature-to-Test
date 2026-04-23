@@ -1,12 +1,10 @@
 const GEO_URL = "https://geocoding-api.open-meteo.com/v1/search";
 
 export interface GeocodeResult {
-  /** Human-readable place for outputs and prompts */
   label: string;
   latitude: number;
   longitude: number;
   population: number;
-  /** ISO 3166-1 alpha-2 from Open-Meteo when present (e.g. for TMDb theatrical region). */
   countryCode?: string;
 }
 
