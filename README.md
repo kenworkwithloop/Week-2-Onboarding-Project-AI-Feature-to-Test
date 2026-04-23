@@ -61,11 +61,11 @@ Optional env:
 ```mermaid
 flowchart TD
   user["messages[] from client"] --> run["runAgent(messages)"]
-  run --> call["OpenAI chat.completions.parse<br/>tools + response_format"]
-  call --> dec{"tool_calls?"}
+  run --> llmParse["OpenAI chat.completions.parse<br/>tools + response_format"]
+  llmParse --> dec{"tool_calls?"}
   dec -- yes --> exec["run tools<br/>(weather / stock / movies / city metrics)"]
   exec --> append["append tool result"]
-  append --> call
+  append --> llmParse
   dec -- no --> parsed["message.parsed"]
   parsed --> out["structured output + chat"]
   out --> done["return AgentSuccess"]
