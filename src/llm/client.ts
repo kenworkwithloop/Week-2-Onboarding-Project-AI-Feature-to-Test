@@ -1,0 +1,171 @@
+import OpenAI from "openai";
+import { zodFunction, zodResponseFormat } from "openai/helpers/zod";
+import { z } from "zod";
+import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
+import { AgentOutputEnvelope } from "../schemas/output.js";
+import type { AgentOutput as AgentOutputT } from "../schemas/output.js";
+import type { ToolCall } from "../tools/types.js";
+import { geocodeFirst } from "../lib/geocoding.js";
+import { getWeather } from "../tools/weather.js";
+
+const DEFAULT_MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
+const MAX_ITERS = 20;
+
+export class ChatError extends Error {
+  constructor(message: string, public toolCalls: ToolCall[]) {
+    super(message);
+    this.name = "ChatError";
+  }
+}
+
+function buildSystemPrompt(): string {
+  const today = new Date().toISOString().slice(0, 10);
+  return `You are a helpful weather-aware travel assistant.
+
+Today's date is ${today} (UTC). Always use dates from today onward; never use dates from your training cutoff.
+
+Tool:
+- get_weather(city, date) returns { location, date, temperature (F), rain_probability (0-1), conditions }. Pass null for date to use today.
+- Valid dates are today through ~14 days from today. Do not call get_weather with past dates.
+- Call it whenever the user wants a plan, forecast, or weather-conditional advice. Do not call tools for small talk.
+- For a multi-day itinerary you may call get_weather once per day, or call it once for today and reuse the result across days.
+- If get_weather returns an error, do NOT retry with the same or different past dates; either use a future date or proceed without weather data.
+
+Final response shape: { "response": <variant> } where variant is exactly one of:
+- CHAT: { type: "CHAT", message } — small talk, clarifications, short factual answers.
+- TRAVEL_ITINERARY: { type: "TRAVEL_ITINERARY", location, days[], budget_estimate, risk_flags[] } — when the user asks for a day-by-day plan.
+  * days[].date is an ISO date YYYY-MM-DD starting at ${today} unless the user specified a start date, incrementing by 1 day.
+  * days[].plan is one short sentence (<=200 chars) with a specific activity for that city.
+  * days[].indoor = true for sheltered activities (museums, galleries, covered markets, indoor shopping).
+  * risk_flags may include "rain" only when rain_probability >= 0.6 from get_weather.
+  * budget_estimate = integer USD total for the whole trip (lodging + food + light activities), realistic for the destination (major metros cost more than mid-size cities).`;
+}
+
+const GetWeatherArgs = z.object({
+  city: z
+    .string()
+    .min(1)
+    .describe("City name to geocode, e.g. 'Seattle' or 'Tokyo Japan'."),
+  date: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .nullable()
+    .describe("ISO date YYYY-MM-DD. Pass null to use today."),
+});
+type GetWeatherArgs = z.infer<typeof GetWeatherArgs>;
+
+let cachedClient: OpenAI | null | undefined;
+
+function getClient(): OpenAI {
+  if (cachedClient) return cachedClient;
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) {
+    throw new Error(
+      "OPENAI_API_KEY is not set. Add it to .env (see .env.example).",
+    );
+  }
+  cachedClient = new OpenAI({ apiKey: key });
+  return cachedClient;
+}
+
+async function runGetWeather(args: GetWeatherArgs) {
+  const geo = await geocodeFirst(args.city);
+  if (!geo) {
+    throw new Error(
+      `Could not geocode "${args.city}". Try a more specific place name.`,
+    );
+  }
+  const date = args.date && args.date.length > 0 ? args.date : new Date().toISOString().slice(0, 10);
+  const weather = await getWeather(geo, date);
+  return { location: geo.label, date, ...weather };
+}
+
+export interface ChatInputMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface ChatResult {
+  output: AgentOutputT;
+  toolCalls: ToolCall[];
+}
+
+export async function runChat(history: ChatInputMessage[]): Promise<ChatResult> {
+  const client = getClient();
+  const toolCalls: ToolCall[] = [];
+  const messages: ChatCompletionMessageParam[] = [
+    { role: "system", content: buildSystemPrompt() },
+    ...history.map<ChatCompletionMessageParam>((m) => ({
+      role: m.role,
+      content: m.content,
+    })),
+  ];
+
+  const tools = [
+    zodFunction({
+      name: "get_weather",
+      parameters: GetWeatherArgs,
+      description:
+        "Get the daily weather forecast for a city on a given date (defaults to today).",
+    }),
+  ];
+
+  const fail = (msg: string) => new ChatError(msg, toolCalls);
+
+  for (let i = 0; i < MAX_ITERS; i++) {
+    const completion = await client.chat.completions.parse({
+      model: DEFAULT_MODEL,
+      temperature: 0.3,
+      messages,
+      tools,
+      response_format: zodResponseFormat(AgentOutputEnvelope, "agent_output"),
+    });
+
+    const message = completion.choices[0]?.message;
+    if (!message) throw fail("OpenAI returned no message.");
+    if (message.refusal) {
+      throw fail(`OpenAI refused the request: ${message.refusal}`);
+    }
+
+    messages.push(message);
+
+    const calls = message.tool_calls ?? [];
+    if (calls.length === 0) {
+      if (!message.parsed) {
+        throw fail("OpenAI returned no parsed content.");
+      }
+      return { output: message.parsed.response, toolCalls };
+    }
+
+    for (const call of calls) {
+      if (call.type !== "function") continue;
+      const started = Date.now();
+      let result: unknown;
+      try {
+        if (call.function.name === "get_weather") {
+          const args = call.function.parsed_arguments as GetWeatherArgs;
+          result = await runGetWeather(args);
+        } else {
+          throw new Error(`Unknown tool: ${call.function.name}`);
+        }
+      } catch (err) {
+        result = { error: err instanceof Error ? err.message : String(err) };
+      }
+
+      toolCalls.push({
+        name: call.function.name,
+        args: (call.function.parsed_arguments ?? {}) as Record<string, unknown>,
+        result,
+        duration_ms: Date.now() - started,
+      });
+
+      messages.push({
+        role: "tool",
+        tool_call_id: call.id,
+        content: JSON.stringify(result),
+      });
+    }
+  }
+
+  throw fail(`Agent exceeded ${MAX_ITERS} tool-calling iterations.`);
+}
