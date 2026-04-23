@@ -1,6 +1,6 @@
 # OmniPlanner Agent
 
-A weather-aware travel chatbot. You send a conversation (`messages[]`) and the LLM decides whether to call the `get_weather` tool and whether to reply as a plain CHAT or a structured TRAVEL_ITINERARY. All responses are validated with Zod before they leave the agent. A working network and a valid `OPENAI_API_KEY` are required.
+A weather-aware travel chatbot with a stock-quote side hustle. You send a conversation (`messages[]`) and the LLM decides whether to call the `get_weather` or `get_stock_data` tool and whether to reply as a plain CHAT or a structured TRAVEL_ITINERARY. All responses are validated with Zod before they leave the agent. A working network and a valid `OPENAI_API_KEY` are required.
 
 ## Stack
 
@@ -8,13 +8,14 @@ A weather-aware travel chatbot. You send a conversation (`messages[]`) and the L
 - **Commander** CLI, **Fastify** `/health` + `/chat` endpoints
 - **OpenAI** structured outputs + function calling (`gpt-4o-mini` by default)
 - **Open-Meteo** geocoding + forecast (no key)
+- **Alpha Vantage** `GLOBAL_QUOTE` for stock quotes (free-tier key required; 5 req/min, 25/day)
 
 ## Repo layout
 
 ```
 src/
   agent/      thin runAgent(messages) wrapper
-  tools/      Open-Meteo weather tool + shared types
+  tools/      Open-Meteo weather tool, Alpha Vantage stock tool, shared types
   lib/        geocoding helper
   llm/        OpenAI chat loop (tools + response_format)
   schemas/    Zod schemas: CHAT | TRAVEL_ITINERARY
@@ -31,6 +32,8 @@ cp .env.example .env
 ```
 
 `OPENAI_API_KEY` is **required**. If the OpenAI call fails (missing key, quota, network, refusal), the agent returns `{ ok: false, error }` with the message.
+
+`ALPHA_VANTAGE_API_KEY` is **required** for `get_stock_data`. The free tier caps you at ~5 requests/minute and 25/day, so the system prompt tells the model to call the tool at most once per ticker per turn.
 
 Optional env:
 
@@ -62,7 +65,9 @@ flowchart TD
   out --> done["return AgentSuccess"]
 ```
 
-A single `chat.completions.parse` call carries BOTH `tools` (one function: `get_weather`) and `response_format` (the `AgentOutput` discriminated union). When the model calls a tool we execute it, append the result, and loop; when it stops calling tools we return the parsed structured response. Bounded to 5 iterations.
+A single `chat.completions.parse` call carries BOTH `tools` (`get_weather`, `get_stock_data`) and `response_format` (the `AgentOutput` union). When the model calls a tool we execute it, append the result, and loop; when it stops calling tools we return the parsed structured response. Bounded to 20 iterations.
+
+`get_stock_data` wraps Alpha Vantage `GLOBAL_QUOTE` and returns `{ price, trend, volatility_score }`, where `volatility_score` is a simple `(high - low) / previous_close` daily-range proxy clamped to `[0, 1]` — not implied vol.
 
 ## Agent contract
 

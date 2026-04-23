@@ -7,6 +7,7 @@ import type { AgentOutput as AgentOutputT } from "../schemas/output.js";
 import type { ToolCall } from "../tools/types.js";
 import { geocodeFirst } from "../lib/geocoding.js";
 import { getWeather } from "../tools/weather.js";
+import { getStockData } from "../tools/stock.js";
 
 const DEFAULT_MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
 const MAX_ITERS = 20;
@@ -20,16 +21,20 @@ export class ChatError extends Error {
 
 function buildSystemPrompt(): string {
   const today = new Date().toISOString().slice(0, 10);
-  return `You are a helpful weather-aware travel assistant.
+  return `You are a helpful assistant for weather-aware travel planning and quick stock quote lookups.
 
 Today's date is ${today} (UTC). Always use dates from today onward; never use dates from your training cutoff.
 
-Tool:
+Tools:
 - get_weather(city, date) returns { location, date, temperature (F), rain_probability (0-1), conditions }. Pass null for date to use today.
-- Valid dates are today through ~14 days from today. Do not call get_weather with past dates.
-- Call it whenever the user wants a plan, forecast, or weather-conditional advice. Do not call tools for small talk.
-- For a multi-day itinerary you may call get_weather once per day, or call it once for today and reuse the result across days.
-- If get_weather returns an error, do NOT retry with the same or different past dates; either use a future date or proceed without weather data.
+  * Valid dates are today through ~14 days from today. Do not call get_weather with past dates.
+  * Call it whenever the user wants a plan, forecast, or weather-conditional advice. Do not call tools for small talk.
+  * For a multi-day itinerary you may call get_weather once per day, or call it once for today and reuse the result across days.
+  * If get_weather returns an error, do NOT retry with the same or different past dates; either use a future date or proceed without weather data.
+- get_stock_data(symbol) returns { price, trend ("up" | "down" | "sideways"), volatility_score (0-1 daily-range proxy) }.
+  * Call it when the user asks about a stock price, trend, or volatility for a specific ticker (e.g. AAPL, MSFT, IBM).
+  * Call it at most once per ticker per user turn. Do not retry on rate-limit errors; surface them in the CHAT reply instead.
+  * Use the full official ticker; if the user names a company, pick its primary US ticker (e.g. "Apple" -> "AAPL").
 
 Final response shape: { "response": <variant> } where variant is exactly one of:
 - CHAT: { type: "CHAT", message } — small talk, clarifications, short factual answers.
@@ -53,6 +58,14 @@ const GetWeatherArgs = z.object({
     .describe("ISO date YYYY-MM-DD. Pass null to use today."),
 });
 type GetWeatherArgs = z.infer<typeof GetWeatherArgs>;
+
+const GetStockDataArgs = z.object({
+  symbol: z
+    .string()
+    .min(1)
+    .describe("Stock ticker symbol, e.g. 'AAPL', 'MSFT', 'IBM'."),
+});
+type GetStockDataArgs = z.infer<typeof GetStockDataArgs>;
 
 let cachedClient: OpenAI | null | undefined;
 
@@ -108,6 +121,12 @@ export async function runChat(history: ChatInputMessage[]): Promise<ChatResult> 
       description:
         "Get the daily weather forecast for a city on a given date (defaults to today).",
     }),
+    zodFunction({
+      name: "get_stock_data",
+      parameters: GetStockDataArgs,
+      description:
+        "Get the latest price, trend, and a daily-range volatility score for a US-listed stock ticker.",
+    }),
   ];
 
   const fail = (msg: string) => new ChatError(msg, toolCalls);
@@ -145,6 +164,9 @@ export async function runChat(history: ChatInputMessage[]): Promise<ChatResult> 
         if (call.function.name === "get_weather") {
           const args = call.function.parsed_arguments as GetWeatherArgs;
           result = await runGetWeather(args);
+        } else if (call.function.name === "get_stock_data") {
+          const args = call.function.parsed_arguments as GetStockDataArgs;
+          result = await getStockData(args.symbol);
         } else {
           throw new Error(`Unknown tool: ${call.function.name}`);
         }
