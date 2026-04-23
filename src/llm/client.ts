@@ -3,14 +3,17 @@ import { zodFunction, zodResponseFormat } from "openai/helpers/zod";
 import { z } from "zod";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { AgentOutputEnvelope } from "../schemas/output.js";
-import type { AgentOutput as AgentOutputT } from "../schemas/output.js";
+import type { AgentOutput as AgentOutputT, ChatOutput as ChatOutputT } from "../schemas/output.js";
 import type { ToolCall } from "../tools/types.js";
 import { geocodeFirst } from "../lib/geocoding.js";
 import { getWeather } from "../tools/weather.js";
 import { getStockData } from "../tools/stock.js";
 
 const DEFAULT_MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
-const MAX_ITERS = 20;
+/** Max chat completions in the tool loop (each can be tool_calls or final parse). */
+const MAX_ITERS = 24;
+/** After this many completions still returning tool_calls, forbid further tools so the model must emit a final structured reply. */
+const FORCE_NO_TOOLS_AFTER_ITER = 7;
 
 export class ChatError extends Error {
   constructor(message: string, public toolCalls: ToolCall[]) {
@@ -33,17 +36,28 @@ Tools:
   * If get_weather returns an error, do NOT retry with the same or different past dates; either use a future date or proceed without weather data.
 - get_stock_data(symbol) returns { price, trend ("up" | "down" | "sideways"), volatility_score (0-1 daily-range proxy) }.
   * Call it when the user asks about a stock price, trend, or volatility for a specific ticker (e.g. AAPL, MSFT, IBM).
-  * Call it at most once per ticker per user turn. Do not retry on rate-limit errors; surface them in the CHAT reply instead.
+  * Call it at most once per ticker per user turn. Do not retry on rate-limit errors; explain them in chat.message (response null if there is no structured payload).
   * Use the full official ticker; if the user names a company, pick its primary US ticker (e.g. "Apple" -> "AAPL").
 
-Final response shape: { "response": <variant> } where variant is exactly one of:
-- CHAT: { type: "CHAT", message } — small talk, clarifications, short factual answers.
+Final structured envelope (always both keys): { "response": <structured object or null>, "chat": { "message": string } }. Never omit chat; chat has only the message field (no type discriminator).
+
+Rules for "response" and "chat" (only one place for conversational text — always in chat):
+- Chat-only turns (greetings, clarifications, short factual answers, errors explained in words): set response to null. Put the full reply only in chat.message.
+- TRAVEL_ITINERARY: response is the full { type, location, days, budget_estimate, risk_flags }. chat.message = 1–3 sentences (intro or wrap-up: trip vibe, weather/budget callouts); do not duplicate day lists in chat.
+- DECISION_REPORT: response holds ONLY { type, options, recommendation } — no prose. chat.message = 2–6 sentences citing tool facts (price, trend, volatility_score, rain_probability, temperature), tradeoffs, caveats, why recommendation won.
+
+Variant for "response" when not null (exactly one):
 - TRAVEL_ITINERARY: { type: "TRAVEL_ITINERARY", location, days[], budget_estimate, risk_flags[] } — when the user asks for a day-by-day plan.
   * days[].date is an ISO date YYYY-MM-DD starting at ${today} unless the user specified a start date, incrementing by 1 day.
   * days[].plan is one short sentence (<=200 chars) with a specific activity for that city.
   * days[].indoor = true for sheltered activities (museums, galleries, covered markets, indoor shopping).
   * risk_flags may include "rain" only when rain_probability >= 0.6 from get_weather.
-  * budget_estimate = integer USD total for the whole trip (lodging + food + light activities), realistic for the destination (major metros cost more than mid-size cities).`;
+  * budget_estimate = integer USD total for the whole trip (lodging + food + light activities), realistic for the destination (major metros cost more than mid-size cities).
+- DECISION_REPORT: { type: "DECISION_REPORT", options: [{ name, score }, ...], recommendation } — compare/choose (e.g. stock vs trip, two tickers).
+  * Call get_stock_data at most once per ticker and get_weather at most once per city for that decision, then immediately respond with zero tool_calls. Never re-call the same tool with the same arguments to "retry".
+  * Call get_stock_data for every stock ticker involved before scoring. If weather matters for travel, call get_weather once for that city (null date = today is fine).
+  * options must have at least 2 entries. Each name is a short human-readable label (e.g. "Travel NYC", "Invest TSLA"). Each score is an integer 0–100 from tool results, not invented numbers.
+  * recommendation must exactly match one options[].name.`;
 }
 
 const GetWeatherArgs = z.object({
@@ -100,12 +114,20 @@ export interface ChatInputMessage {
 
 export interface ChatResult {
   output: AgentOutputT;
+  /** Always present alongside `output`: `{ message: string }`. */
+  chat: ChatOutputT;
   toolCalls: ToolCall[];
+}
+
+function toolDedupeKey(name: string, args: Record<string, unknown>): string {
+  return `${name}:${JSON.stringify(args)}`;
 }
 
 export async function runChat(history: ChatInputMessage[]): Promise<ChatResult> {
   const client = getClient();
   const toolCalls: ToolCall[] = [];
+  /** Same-turn duplicate tool+args → reuse JSON result string (stops rate-limit hammer / retry loops). */
+  const toolResultByKey = new Map<string, string>();
   const messages: ChatCompletionMessageParam[] = [
     { role: "system", content: buildSystemPrompt() },
     ...history.map<ChatCompletionMessageParam>((m) => ({
@@ -132,11 +154,14 @@ export async function runChat(history: ChatInputMessage[]): Promise<ChatResult> 
   const fail = (msg: string) => new ChatError(msg, toolCalls);
 
   for (let i = 0; i < MAX_ITERS; i++) {
+    const forceNoTools = i >= FORCE_NO_TOOLS_AFTER_ITER;
     const completion = await client.chat.completions.parse({
       model: DEFAULT_MODEL,
       temperature: 0.3,
       messages,
       tools,
+      // API requires `tools` whenever `tool_choice` is set; `"none"` blocks further tool calls.
+      tool_choice: forceNoTools ? "none" : "auto",
       response_format: zodResponseFormat(AgentOutputEnvelope, "agent_output"),
     });
 
@@ -153,30 +178,46 @@ export async function runChat(history: ChatInputMessage[]): Promise<ChatResult> 
       if (!message.parsed) {
         throw fail("OpenAI returned no parsed content.");
       }
-      return { output: message.parsed.response, toolCalls };
+      return {
+        output: message.parsed.response,
+        chat: message.parsed.chat,
+        toolCalls,
+      };
     }
 
     for (const call of calls) {
       if (call.type !== "function") continue;
       const started = Date.now();
+      const argsObj = (call.function.parsed_arguments ?? {}) as Record<string, unknown>;
+      const dedupeKey = toolDedupeKey(call.function.name, argsObj);
+      const cached = toolResultByKey.get(dedupeKey);
+      let contentStr: string;
       let result: unknown;
-      try {
-        if (call.function.name === "get_weather") {
-          const args = call.function.parsed_arguments as GetWeatherArgs;
-          result = await runGetWeather(args);
-        } else if (call.function.name === "get_stock_data") {
-          const args = call.function.parsed_arguments as GetStockDataArgs;
-          result = await getStockData(args.symbol);
-        } else {
-          throw new Error(`Unknown tool: ${call.function.name}`);
+
+      if (cached !== undefined) {
+        contentStr = cached;
+        result = JSON.parse(cached) as unknown;
+      } else {
+        try {
+          if (call.function.name === "get_weather") {
+            const args = call.function.parsed_arguments as GetWeatherArgs;
+            result = await runGetWeather(args);
+          } else if (call.function.name === "get_stock_data") {
+            const args = call.function.parsed_arguments as GetStockDataArgs;
+            result = await getStockData(args.symbol);
+          } else {
+            throw new Error(`Unknown tool: ${call.function.name}`);
+          }
+        } catch (err) {
+          result = { error: err instanceof Error ? err.message : String(err) };
         }
-      } catch (err) {
-        result = { error: err instanceof Error ? err.message : String(err) };
+        contentStr = JSON.stringify(result);
+        toolResultByKey.set(dedupeKey, contentStr);
       }
 
       toolCalls.push({
         name: call.function.name,
-        args: (call.function.parsed_arguments ?? {}) as Record<string, unknown>,
+        args: argsObj,
         result,
         duration_ms: Date.now() - started,
       });
@@ -184,7 +225,7 @@ export async function runChat(history: ChatInputMessage[]): Promise<ChatResult> 
       messages.push({
         role: "tool",
         tool_call_id: call.id,
-        content: JSON.stringify(result),
+        content: contentStr,
       });
     }
   }

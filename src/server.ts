@@ -47,7 +47,7 @@ export async function buildServer() {
       reply.code(422);
       return { ok: false, error: result.error, toolCalls: result.toolCalls };
     }
-    return { ok: true, output: result.output, toolCalls: result.toolCalls };
+    return { ok: true, output: result.output, chat: result.chat, toolCalls: result.toolCalls };
   });
 
   return app;

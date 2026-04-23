@@ -1,6 +1,6 @@
 # OmniPlanner Agent
 
-A weather-aware travel chatbot with a stock-quote side hustle. You send a conversation (`messages[]`) and the LLM decides whether to call the `get_weather` or `get_stock_data` tool and whether to reply as a plain CHAT or a structured TRAVEL_ITINERARY. All responses are validated with Zod before they leave the agent. A working network and a valid `OPENAI_API_KEY` are required.
+A weather-aware travel chatbot with a stock-quote side hustle. You send a conversation (`messages[]`) and the LLM may call `get_weather` or `get_stock_data`, then returns **always** `chat: { "message": "..." }` plus **`output`**: a `TRAVEL_ITINERARY`, a `DECISION_REPORT`, or **`null`** on chat-only turns. All responses are validated with Zod. A working network and a valid `OPENAI_API_KEY` are required.
 
 ## Stack
 
@@ -18,8 +18,8 @@ src/
   tools/      Open-Meteo weather tool, Alpha Vantage stock tool, shared types
   lib/        geocoding helper
   llm/        OpenAI chat loop (tools + response_format)
-  schemas/    Zod schemas: CHAT | TRAVEL_ITINERARY
-  cli.ts      `omniplanner run --prompt "..."`
+  schemas/    Zod: `chat` + structured `output` (or null)
+  cli.ts      `omniplanner run <message words...>`
   server.ts   Fastify HTTP interface
 ```
 
@@ -44,9 +44,9 @@ Optional env:
 
 | Command | What it does |
 |---|---|
-| `npm run dev -- run --prompt "hi"` | Run the CLI once via `tsx` (single-message chat) |
-| `npm run dev -- run --prompt "Plan a weekend in Seattle"` | Same, produces a TRAVEL_ITINERARY |
-| `npm run build && npm start -- run --prompt "..."` | Build, then run from `dist/` |
+| `npm run dev -- run hi` | Run the CLI once via `tsx` (single-message chat) |
+| `npm run dev -- run Plan a weekend in Seattle` | Same; all words after `run` are the prompt (no quotes required) |
+| `npm run build && npm start -- run Compare TSLA and travel to NYC` | Build, then run from `dist/` |
 | `npm run serve` | Fastify on `http://localhost:3000` with `GET /health` and `POST /chat` |
 | `npm run lint:types` | Strict `tsc --noEmit` type check |
 
@@ -61,11 +61,11 @@ flowchart TD
   exec --> append["append tool result"]
   append --> call
   dec -- no --> parsed["message.parsed"]
-  parsed --> out{"CHAT or TRAVEL_ITINERARY"}
+  parsed --> out["structured output + chat"]
   out --> done["return AgentSuccess"]
 ```
 
-A single `chat.completions.parse` call carries BOTH `tools` (`get_weather`, `get_stock_data`) and `response_format` (the `AgentOutput` union). When the model calls a tool we execute it, append the result, and loop; when it stops calling tools we return the parsed structured response. Bounded to 20 iterations.
+A single `chat.completions.parse` call carries BOTH `tools` (`get_weather`, `get_stock_data`) and `response_format` (the `AgentOutputEnvelope`: nullable structured `response` + `chat`). When the model calls a tool we execute it, append the result, and loop; when it stops calling tools we return the parsed envelope. Bounded to 24 iterations.
 
 `get_stock_data` wraps Alpha Vantage `GLOBAL_QUOTE` and returns `{ price, trend, volatility_score }`, where `volatility_score` is a simple `(high - low) / previous_close` daily-range proxy clamped to `[0, 1]` — not implied vol.
 
@@ -73,8 +73,10 @@ A single `chat.completions.parse` call carries BOTH `tools` (`get_weather`, `get
 
 Responses conform to the Zod schema in [src/schemas/output.ts](src/schemas/output.ts):
 
-- `CHAT` — `{ type: "CHAT", message: string }`. Small talk, clarifications, short factual answers.
-- `TRAVEL_ITINERARY` — `{ type: "TRAVEL_ITINERARY", location, days[], budget_estimate, risk_flags[] }`. Day-by-day plans. `budget_estimate` is an integer USD ballpark; `risk_flags` can only contain `"rain"`.
+- **`chat`** — always `{ "message": "..." }` (no `type` field). This is the **only** place for conversational prose on chat-only turns. For itineraries it is a short intro/wrap-up; for decisions it explains scores and tradeoffs.
+- **`output`** — `TRAVEL_ITINERARY`, `DECISION_REPORT`, or **`null`**. When the user only needs a conversational reply, `output` is `null` and the reply lives entirely in `chat`.
+- `TRAVEL_ITINERARY` — `{ type: "TRAVEL_ITINERARY", location, days[], budget_estimate, risk_flags[] }`. `budget_estimate` is an integer USD ballpark; `risk_flags` can only contain `"rain"`.
+- `DECISION_REPORT` — `{ type: "DECISION_REPORT", options: [{ name, score }], recommendation }` only (no prose inside `output`).
 
 ## HTTP API
 
@@ -98,7 +100,21 @@ Response (success):
 {
   "ok": true,
   "output": { "type": "TRAVEL_ITINERARY", "location": "...", "days": [...], "budget_estimate": 450, "risk_flags": [] },
+  "chat": { "message": "Here's a concise intro or wrap-up for the trip..." },
   "toolCalls": [ { "name": "get_weather", "args": {...}, "result": {...}, "duration_ms": 123 } ]
+}
+```
+
+`chat` is always present. For `DECISION_REPORT`, use `chat.message` for the narrative; keep scores only in `output`.
+
+Chat-only success example:
+
+```json
+{
+  "ok": true,
+  "output": null,
+  "chat": { "message": "Hello! How can I help?" },
+  "toolCalls": []
 }
 ```
 

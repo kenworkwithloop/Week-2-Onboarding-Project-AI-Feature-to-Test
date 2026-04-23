@@ -18,19 +18,52 @@ export const TravelItinerary = z.object({
   risk_flags: z.array(RiskFlag),
 });
 
-export const ChatMessage = z.object({
-  type: z.literal("CHAT"),
+/** Natural-language layer in API responses: `{ "message": "..." }` only. */
+export const ChatOutput = z.object({
   message: z.string(),
 });
 
-export const AgentOutput = z.union([TravelItinerary, ChatMessage]);
+export const DecisionOption = z.object({
+  name: z.string().min(1),
+  /** Integer 0–100; higher is more attractive per your reasoning. */
+  score: z.number().int().min(0).max(100),
+});
 
-/** Envelope used as the root schema for OpenAI structured outputs (which requires an object root). */
+export const DecisionReport = z
+  .object({
+    type: z.literal("DECISION_REPORT"),
+    options: z.array(DecisionOption).min(2),
+    /** Must exactly match one of `options[].name`. */
+    recommendation: z.string().min(1),
+  })
+  .superRefine((data, ctx) => {
+    const names = data.options.map((o) => o.name);
+    if (!names.includes(data.recommendation)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["recommendation"],
+        message: "recommendation must exactly match one of options[].name",
+      });
+    }
+  });
+
+/** Itinerary or decision scores only — prose lives in `chat.message`. */
+export const AgentStructured = z.union([TravelItinerary, DecisionReport]);
+
+/**
+ * Root schema for OpenAI structured outputs (object root).
+ * `chat` is always the user-facing prose; `response` is structured data or null for chat-only turns.
+ */
 export const AgentOutputEnvelope = z.object({
-  response: AgentOutput,
+  response: AgentStructured.nullable(),
+  chat: ChatOutput,
 });
 
 export type TravelItinerary = z.infer<typeof TravelItinerary>;
-export type ChatMessage = z.infer<typeof ChatMessage>;
-export type AgentOutput = z.infer<typeof AgentOutput>;
+export type ChatOutput = z.infer<typeof ChatOutput>;
+export type DecisionOption = z.infer<typeof DecisionOption>;
+export type DecisionReport = z.infer<typeof DecisionReport>;
+export type AgentStructured = z.infer<typeof AgentStructured>;
+/** Public `output` field: structured payload or null when the reply is chat-only. */
+export type AgentOutput = AgentStructured | null;
 export type AgentOutputEnvelope = z.infer<typeof AgentOutputEnvelope>;

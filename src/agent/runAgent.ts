@@ -1,11 +1,13 @@
 import { runChat, ChatError, type ChatInputMessage } from "../llm/client.js";
 import type { ToolCall } from "../tools/types.js";
-import type { AgentOutput } from "../schemas/output.js";
+import type { AgentOutput, ChatOutput } from "../schemas/output.js";
 
 export interface AgentSuccess {
   ok: true;
   messages: ChatInputMessage[];
   output: AgentOutput;
+  /** Always returned with output: `{ message }` only. */
+  chat: ChatOutput;
   toolCalls: ToolCall[];
 }
 
@@ -20,8 +22,8 @@ export type AgentResult = AgentSuccess | AgentFailure;
 
 export async function runAgent(messages: ChatInputMessage[]): Promise<AgentResult> {
   try {
-    const { output, toolCalls } = await runChat(messages);
-    return { ok: true, messages, output, toolCalls };
+    const { output, chat, toolCalls } = await runChat(messages);
+    return { ok: true, messages, output, chat, toolCalls };
   } catch (err) {
     return {
       ok: false,

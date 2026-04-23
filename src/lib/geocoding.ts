@@ -18,10 +18,26 @@ interface RawHit {
   admin1?: string;
 }
 
-export async function geocodeFirst(query: string): Promise<GeocodeResult | null> {
-  const q = query.trim();
-  if (!q) return null;
-  const url = `${GEO_URL}?name=${encodeURIComponent(q)}&count=1`;
+/** Open-Meteo search often misses comma-heavy strings (e.g. "Denver, Colorado"); try fallbacks. */
+function geocodeCandidates(raw: string): string[] {
+  const q = raw.trim().replace(/\s+/g, " ");
+  if (!q) return [];
+  const out: string[] = [];
+  const add = (s: string) => {
+    const t = s.trim().replace(/\s+/g, " ");
+    if (t.length > 0 && !out.includes(t)) out.push(t);
+  };
+  add(q);
+  const comma = q.indexOf(",");
+  if (comma > 0) {
+    add(q.slice(0, comma));
+    add(q.replace(/,/g, " "));
+  }
+  return out;
+}
+
+async function geocodeOnce(name: string): Promise<GeocodeResult | null> {
+  const url = `${GEO_URL}?name=${encodeURIComponent(name)}&count=1`;
   const res = await fetch(url);
   if (!res.ok) return null;
   const data = (await res.json()) as { results?: RawHit[] };
@@ -30,6 +46,14 @@ export async function geocodeFirst(query: string): Promise<GeocodeResult | null>
   const population = typeof r.population === "number" && r.population > 0 ? r.population : 50_000;
   const label = formatPlaceLabel(r);
   return { label, latitude: r.latitude, longitude: r.longitude, population };
+}
+
+export async function geocodeFirst(query: string): Promise<GeocodeResult | null> {
+  for (const candidate of geocodeCandidates(query)) {
+    const hit = await geocodeOnce(candidate);
+    if (hit) return hit;
+  }
+  return null;
 }
 
 function formatPlaceLabel(r: RawHit): string {

@@ -13,16 +13,31 @@ program
 program
   .command("run")
   .description("Send a single user message to the agent.")
-  .requiredOption("-p, --prompt <text>", "User message, e.g. 'Plan a weekend in Seattle' or 'hi'")
-  .action(async (opts: { prompt: string }) => {
-    const result = await runAgent([{ role: "user", content: opts.prompt }]);
+  .argument(
+    "<words...>",
+    "Full user message (all words after `run`; no quotes needed). Example: run Should I invest in TSLA?",
+  )
+  .action(async (words: string[]) => {
+    const prompt = words.join(" ").trim();
+    if (!prompt) {
+      console.error(
+        'Missing prompt: put your message after `run`, e.g. npm run dev -- run Should I invest in TSLA?',
+      );
+      process.exitCode = 1;
+      return;
+    }
+    const result = await runAgent([{ role: "user", content: prompt }]);
     if (!result.ok) {
       console.error(JSON.stringify({ ok: false, error: result.error }, null, 2));
       process.exitCode = 1;
       return;
     }
     console.log(
-      JSON.stringify({ ok: true, output: result.output, toolCalls: result.toolCalls }, null, 2),
+      JSON.stringify(
+        { ok: true, output: result.output, chat: result.chat, toolCalls: result.toolCalls },
+        null,
+        2,
+      ),
     );
   });
 
