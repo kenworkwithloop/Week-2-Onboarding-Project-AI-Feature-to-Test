@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 /**
- * Run the eval venv's `deepeval` CLI from the repo root so dotenv (.env / .env.local) loads.
+ * Run the eval venv's `deepeval` CLI from the repo root so:
+ * - The venv's Python/deepeval install is used (not a global `python3`).
+ * - DeepEval loads `.env` / `.env.local` from this directory (`cwd` + `ENV_DIR_PATH`; see Confident AI docs).
  */
 const fs = require("fs");
 const path = require("path");
@@ -33,6 +35,7 @@ if (!bin) {
 }
 
 const env = { ...process.env };
+// Prefer project dotenv files when cwd is root (DeepEval also scans cwd).
 if (!env.ENV_DIR_PATH) env.ENV_DIR_PATH = root;
 
 const r = spawnSync(bin, process.argv.slice(2), {
