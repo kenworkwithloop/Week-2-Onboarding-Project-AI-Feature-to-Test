@@ -1,6 +1,6 @@
 # OmniPlanner Agent
 
-A weather-aware travel chatbot with a stock-quote side hustle. You send a conversation (`messages[]`) and the LLM may call `get_weather` or `get_stock_data`, then returns **always** `chat: { "message": "..." }` plus **`output`**: a `TRAVEL_ITINERARY`, a `DECISION_REPORT`, or **`null`** on chat-only turns. All responses are validated with Zod. A working network and a valid `OPENAI_API_KEY` are required.
+A weather-aware travel chatbot with a stock-quote side hustle and a **movies in theaters** tool. You send a conversation (`messages[]`) and the LLM may call `get_weather`, `get_stock_data`, or `get_local_movies`, then returns **always** `chat: { "message": "..." }` plus **`output`**: a `TRAVEL_ITINERARY`, a `DECISION_REPORT`, or **`null`** on chat-only turns. All responses are validated with Zod. A working network and a valid `OPENAI_API_KEY` are required.
 
 ## Stack
 
@@ -9,13 +9,14 @@ A weather-aware travel chatbot with a stock-quote side hustle. You send a conver
 - **OpenAI** structured outputs + function calling (`gpt-4o-mini` by default)
 - **Open-Meteo** geocoding + forecast (no key)
 - **Alpha Vantage** `GLOBAL_QUOTE` for stock quotes (free-tier key required; 5 req/min, 25/day)
+- **The Movie Database (TMDb)** v3 `movie/now_playing` for `get_local_movies` ([API key](https://www.themoviedb.org/settings/api))
 
 ## Repo layout
 
 ```
 src/
   agent/      thin runAgent(messages) wrapper
-  tools/      Open-Meteo weather tool, Alpha Vantage stock tool, shared types
+  tools/      weather, stock, TMDb movies; shared types
   lib/        geocoding helper
   llm/        OpenAI chat loop (tools + response_format)
   schemas/    Zod: `chat` + structured `output` (or null)
@@ -34,6 +35,8 @@ cp .env.example .env
 `OPENAI_API_KEY` is **required**. If the OpenAI call fails (missing key, quota, network, refusal), the agent returns `{ ok: false, error }` with the message.
 
 `ALPHA_VANTAGE_API_KEY` is **required** for `get_stock_data`. The free tier caps you at ~5 requests/minute and 25/day, so the system prompt tells the model to call the tool at most once per ticker per turn.
+
+`THE_MOVIE_DB_API_KEY` is **required** for `get_local_movies`. The tool geocodes the **user’s city/place**, uses that result’s **ISO country** as TMDb’s `region`, and returns up to 10 **now playing** titles for that **country’s theatrical market** (not per-cinema or hyper-local zip granularity).
 
 Optional env:
 
@@ -57,7 +60,7 @@ flowchart TD
   user["messages[] from client"] --> run["runAgent(messages)"]
   run --> call["OpenAI chat.completions.parse<br/>tools + response_format"]
   call --> dec{"tool_calls?"}
-  dec -- yes --> exec["run get_weather<br/>(geocode then forecast)"]
+  dec -- yes --> exec["run tools<br/>(weather / stock / movies)"]
   exec --> append["append tool result"]
   append --> call
   dec -- no --> parsed["message.parsed"]
@@ -65,9 +68,11 @@ flowchart TD
   out --> done["return AgentSuccess"]
 ```
 
-A single `chat.completions.parse` call carries BOTH `tools` (`get_weather`, `get_stock_data`) and `response_format` (the `AgentOutputEnvelope`: nullable structured `response` + `chat`). When the model calls a tool we execute it, append the result, and loop; when it stops calling tools we return the parsed envelope. Bounded to 24 iterations.
+A single `chat.completions.parse` call carries BOTH `tools` (`get_weather`, `get_stock_data`, `get_local_movies`) and `response_format` (the `AgentOutputEnvelope`: nullable structured `response` + `chat`). When the model calls a tool we execute it, append the result, and loop; when it stops calling tools we return the parsed envelope. Bounded to 24 iterations.
 
 `get_stock_data` wraps Alpha Vantage `GLOBAL_QUOTE` and returns `{ price, trend, volatility_score }`, where `volatility_score` is a simple `(high - low) / previous_close` daily-range proxy clamped to `[0, 1]` — not implied vol.
+
+`get_local_movies` (see [src/tools/movies.ts](src/tools/movies.ts)) geocodes the `city` argument (same Open-Meteo geocoder as weather, including comma fallbacks), then calls TMDb **`/movie/now_playing`** with `region` = that place’s **country code** (fallback `US` only if geocode has no `country_code`). Returns `{ location, region, movies }` where each movie has `title`, `release_date`, `vote_average`, and a truncated `overview`.
 
 For `DECISION_REPORT` responses, [src/lib/investmentRules.ts](src/lib/investmentRules.ts) applies a deterministic rule after the model returns: if a stock’s `trend` is `"down"` **and** `volatility_score` **>** `0.7` (i.e. above 70 on a 0–100-style scale), that stock option’s score is reduced by 20 points (clamped to 0–100) and `recommendation` is set to the highest-scoring option’s `name` (stock option names should include the ticker, e.g. `"Invest TSLA"`, so the rule can match tool results).
 

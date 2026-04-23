@@ -6,6 +6,8 @@ export interface GeocodeResult {
   latitude: number;
   longitude: number;
   population: number;
+  /** ISO 3166-1 alpha-2 from Open-Meteo when present (e.g. for TMDb theatrical region). */
+  countryCode?: string;
 }
 
 interface RawHit {
@@ -45,7 +47,11 @@ async function geocodeOnce(name: string): Promise<GeocodeResult | null> {
   if (r == null || typeof r.latitude !== "number" || typeof r.longitude !== "number") return null;
   const population = typeof r.population === "number" && r.population > 0 ? r.population : 50_000;
   const label = formatPlaceLabel(r);
-  return { label, latitude: r.latitude, longitude: r.longitude, population };
+  const cc =
+    typeof r.country_code === "string" && /^[A-Za-z]{2}$/.test(r.country_code)
+      ? r.country_code.toUpperCase()
+      : undefined;
+  return { label, latitude: r.latitude, longitude: r.longitude, population, countryCode: cc };
 }
 
 export async function geocodeFirst(query: string): Promise<GeocodeResult | null> {

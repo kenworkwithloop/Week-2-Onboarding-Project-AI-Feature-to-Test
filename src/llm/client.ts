@@ -8,6 +8,7 @@ import type { ToolCall } from "../tools/types.js";
 import { geocodeFirst } from "../lib/geocoding.js";
 import { getWeather } from "../tools/weather.js";
 import { getStockData } from "../tools/stock.js";
+import { getLocalMovies } from "../tools/movies.js";
 
 const DEFAULT_MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
 /** Max chat completions in the tool loop (each can be tool_calls or final parse). */
@@ -24,7 +25,7 @@ export class ChatError extends Error {
 
 function buildSystemPrompt(): string {
   const today = new Date().toISOString().slice(0, 10);
-  return `You are a helpful assistant for weather-aware travel planning and quick stock quote lookups.
+  return `You are a helpful assistant for weather-aware travel planning, stock quotes, and movies in theaters (by country).
 
 Today's date is ${today} (UTC). Always use dates from today onward; never use dates from your training cutoff.
 
@@ -38,6 +39,10 @@ Tools:
   * Call it when the user asks about a stock price, trend, or volatility for a specific ticker (e.g. AAPL, MSFT, IBM).
   * Call it at most once per ticker per user turn. Do not retry on rate-limit errors; explain them in chat.message (response null if there is no structured payload).
   * Use the full official ticker; if the user names a company, pick its primary US ticker (e.g. "Apple" -> "AAPL").
+- get_local_movies(city) returns { location, region, movies: [{ title, release_date, vote_average, overview }] }. Theatrical "now playing" for the **country** of the geocoded place (same city string the user asked about — pass that trip city or place name). Not per-theater or neighborhood precision.
+  * Call when the user asks what is playing, wants cinema ideas, or indoor entertainment for a trip. Use the same city/place wording the user gave (or the itinerary city).
+  * Call at most once per distinct city per user turn. Do not retry on API errors; mention them in chat.message.
+  * Requires THE_MOVIE_DB_API_KEY on the server.
 
 Final structured envelope (always both keys): { "response": <structured object or null>, "chat": { "message": string } }. Never omit chat; chat has only the message field (no type discriminator).
 
@@ -80,6 +85,16 @@ const GetStockDataArgs = z.object({
     .describe("Stock ticker symbol, e.g. 'AAPL', 'MSFT', 'IBM'."),
 });
 type GetStockDataArgs = z.infer<typeof GetStockDataArgs>;
+
+const GetLocalMoviesArgs = z.object({
+  city: z
+    .string()
+    .min(1)
+    .describe(
+      "City or place the user asked about (e.g. trip destination). Used to geocode and pick that country's theatrical listings.",
+    ),
+});
+type GetLocalMoviesArgs = z.infer<typeof GetLocalMoviesArgs>;
 
 let cachedClient: OpenAI | null | undefined;
 
@@ -149,6 +164,12 @@ export async function runChat(history: ChatInputMessage[]): Promise<ChatResult> 
       description:
         "Get the latest price, trend, and a daily-range volatility score for a US-listed stock ticker.",
     }),
+    zodFunction({
+      name: "get_local_movies",
+      parameters: GetLocalMoviesArgs,
+      description:
+        "The Movie Database: now-playing movies for the country of the given city/place (after geocode). Pass the user's location string.",
+    }),
   ];
 
   const fail = (msg: string) => new ChatError(msg, toolCalls);
@@ -205,6 +226,9 @@ export async function runChat(history: ChatInputMessage[]): Promise<ChatResult> 
           } else if (call.function.name === "get_stock_data") {
             const args = call.function.parsed_arguments as GetStockDataArgs;
             result = await getStockData(args.symbol);
+          } else if (call.function.name === "get_local_movies") {
+            const args = call.function.parsed_arguments as GetLocalMoviesArgs;
+            result = await getLocalMovies(args.city);
           } else {
             throw new Error(`Unknown tool: ${call.function.name}`);
           }
