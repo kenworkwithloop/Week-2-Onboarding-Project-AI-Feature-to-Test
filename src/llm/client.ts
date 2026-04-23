@@ -56,8 +56,8 @@ Variant for "response" when not null (exactly one):
 - DECISION_REPORT: { type: "DECISION_REPORT", options: [{ name, score }, ...], recommendation } — compare/choose (e.g. stock vs trip, two tickers).
   * Call get_stock_data at most once per ticker and get_weather at most once per city for that decision, then immediately respond with zero tool_calls. Never re-call the same tool with the same arguments to "retry".
   * Call get_stock_data for every stock ticker involved before scoring. If weather matters for travel, call get_weather once for that city (null date = today is fine).
-  * options must have at least 2 entries. Each name is a short human-readable label (e.g. "Travel NYC", "Invest TSLA"). Each score is an integer 0–100 from tool results, not invented numbers.
-  * recommendation must exactly match one options[].name.`;
+  * options must have at least 2 entries. Each name is a short human-readable label (e.g. "Travel NYC", "Invest TSLA"). Each score is an integer 0–100 from tool results, not invented numbers. Include the ticker substring in stock option names (e.g. "TSLA") so server-side rules can match them.
+  * recommendation must exactly match one options[].name. After your reply, the server applies a deterministic investment rule: if get_stock_data shows trend "down" AND volatility_score > 0.7 (70 on a 0–100-style scale), that stock option's score is reduced and recommendation is recomputed as the top-scoring option.`;
 }
 
 const GetWeatherArgs = z.object({

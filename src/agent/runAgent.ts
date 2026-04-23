@@ -1,4 +1,5 @@
 import { runChat, ChatError, type ChatInputMessage } from "../llm/client.js";
+import { applyInvestmentRulesToDecision } from "../lib/investmentRules.js";
 import type { ToolCall } from "../tools/types.js";
 import type { AgentOutput, ChatOutput } from "../schemas/output.js";
 
@@ -23,7 +24,11 @@ export type AgentResult = AgentSuccess | AgentFailure;
 export async function runAgent(messages: ChatInputMessage[]): Promise<AgentResult> {
   try {
     const { output, chat, toolCalls } = await runChat(messages);
-    return { ok: true, messages, output, chat, toolCalls };
+    const adjustedOutput =
+      output?.type === "DECISION_REPORT"
+        ? applyInvestmentRulesToDecision(output, toolCalls)
+        : output;
+    return { ok: true, messages, output: adjustedOutput, chat, toolCalls };
   } catch (err) {
     return {
       ok: false,
