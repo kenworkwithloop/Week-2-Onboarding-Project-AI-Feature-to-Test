@@ -9,7 +9,6 @@ export type StockTrend = "up" | "down" | "sideways";
 export interface StockReport {
   price: number;
   trend: StockTrend;
-  /** Daily-range proxy on [0, 1]: (high - low) / previous_close. Not implied vol. */
   volatility_score: number;
 }
 
@@ -17,19 +16,29 @@ export interface MovieListing {
   title: string;
   release_date: string;
   vote_average: number;
-  /** Truncated for token size; may be empty. */
   overview: string;
 }
 
-/**
- * Theatrical "now playing" for the geocoded place's country (TMDb `region`), not per-venue.
- */
 export interface MovieReport {
-  /** Resolved place label from geocode (user's prompted location). */
   location: string;
-  /** ISO 3166-1 alpha-2 used for TMDb region. */
   region: string;
   movies: MovieListing[];
+}
+
+/**
+ * Federal open data city metrics (Census / Data.gov ecosystem).
+ * Full numeric fields are US-only (ACS 5-year via api.census.gov); non-US sets `limited: true`.
+ */
+export interface CityReport {
+  location: string;
+  country_code?: string;
+  population?: number;
+  median_household_income_usd: number | null;
+  median_gross_rent_usd: number | null;
+  cost_index: number;
+  limited: boolean;
+  note?: string;
+  data_source: string;
 }
 
 export interface ToolCall {

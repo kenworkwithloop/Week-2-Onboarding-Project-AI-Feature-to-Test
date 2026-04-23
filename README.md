@@ -1,6 +1,6 @@
 # OmniPlanner Agent
 
-A weather-aware travel chatbot with a stock-quote side hustle and a **movies in theaters** tool. You send a conversation (`messages[]`) and the LLM may call `get_weather`, `get_stock_data`, or `get_local_movies`, then returns **always** `chat: { "message": "..." }` plus **`output`**: a `TRAVEL_ITINERARY`, a `DECISION_REPORT`, or **`null`** on chat-only turns. All responses are validated with Zod. A working network and a valid `OPENAI_API_KEY` are required.
+A weather-aware travel chatbot with a stock-quote side hustle, a **movies in theaters** tool, and a **US city cost-of-living** tool. You send a conversation (`messages[]`) and the LLM may call `get_weather`, `get_stock_data`, `get_local_movies`, or `get_city_metrics`, then returns **always** `chat: { "message": "..." }` plus **`output`**: a `TRAVEL_ITINERARY`, a `DECISION_REPORT`, or **`null`** on chat-only turns. All responses are validated with Zod. A working network and a valid `OPENAI_API_KEY` are required.
 
 ## Stack
 
@@ -10,13 +10,14 @@ A weather-aware travel chatbot with a stock-quote side hustle and a **movies in 
 - **Open-Meteo** geocoding + forecast (no key)
 - **Alpha Vantage** `GLOBAL_QUOTE` for stock quotes (free-tier key required; 5 req/min, 25/day)
 - **The Movie Database (TMDb)** v3 `movie/now_playing` for `get_local_movies` ([API key](https://www.themoviedb.org/settings/api))
+- **US Census Bureau** ACS 5-year + [Census Geocoder](https://geocoding.census.gov/) for `get_city_metrics` — the federal open-data (Data.gov ecosystem) source behind city income/rent signals. ACS requires a free [Census API key](https://api.census.gov/data/key_signup.html); the Geocoder does not.
 
 ## Repo layout
 
 ```
 src/
   agent/      thin runAgent(messages) wrapper
-  tools/      weather, stock, TMDb movies; shared types
+  tools/      weather, stock, TMDb movies, Census city metrics; shared types
   lib/        geocoding helper
   llm/        OpenAI chat loop (tools + response_format)
   schemas/    Zod: `chat` + structured `output` (or null)
@@ -37,6 +38,8 @@ cp .env.example .env
 `ALPHA_VANTAGE_API_KEY` is **required** for `get_stock_data`. The free tier caps you at ~5 requests/minute and 25/day, so the system prompt tells the model to call the tool at most once per ticker per turn.
 
 `THE_MOVIE_DB_API_KEY` is **required** for `get_local_movies`. The tool geocodes the **user’s city/place**, uses that result’s **ISO country** as TMDb’s `region`, and returns up to 10 **now playing** titles for that **country’s theatrical market** (not per-cinema or hyper-local zip granularity).
+
+`CENSUS_API_KEY` is **required** for full US numbers from `get_city_metrics` (ACS median household income `B19013_001E` and median gross rent `B25064_001E`). Without it, the tool still responds but sets `limited: true` and falls back to a population-based `cost_index`. Non-US places always return `limited: true` since ACS is US-only; this is why the tool is framed as a **federal open-data (Census / Data.gov ecosystem)** signal rather than a single global “Data.gov” endpoint.
 
 Optional env:
 
@@ -60,7 +63,7 @@ flowchart TD
   user["messages[] from client"] --> run["runAgent(messages)"]
   run --> call["OpenAI chat.completions.parse<br/>tools + response_format"]
   call --> dec{"tool_calls?"}
-  dec -- yes --> exec["run tools<br/>(weather / stock / movies)"]
+  dec -- yes --> exec["run tools<br/>(weather / stock / movies / city metrics)"]
   exec --> append["append tool result"]
   append --> call
   dec -- no --> parsed["message.parsed"]
@@ -68,11 +71,13 @@ flowchart TD
   out --> done["return AgentSuccess"]
 ```
 
-A single `chat.completions.parse` call carries BOTH `tools` (`get_weather`, `get_stock_data`, `get_local_movies`) and `response_format` (the `AgentOutputEnvelope`: nullable structured `response` + `chat`). When the model calls a tool we execute it, append the result, and loop; when it stops calling tools we return the parsed envelope. Bounded to 24 iterations.
+A single `chat.completions.parse` call carries BOTH `tools` (`get_weather`, `get_stock_data`, `get_local_movies`, `get_city_metrics`) and `response_format` (the `AgentOutputEnvelope`: nullable structured `response` + `chat`). When the model calls a tool we execute it, append the result, and loop; when it stops calling tools we return the parsed envelope. Bounded to 24 iterations.
 
 `get_stock_data` wraps Alpha Vantage `GLOBAL_QUOTE` and returns `{ price, trend, volatility_score }`, where `volatility_score` is a simple `(high - low) / previous_close` daily-range proxy clamped to `[0, 1]` — not implied vol.
 
 `get_local_movies` (see [src/tools/movies.ts](src/tools/movies.ts)) geocodes the `city` argument (same Open-Meteo geocoder as weather, including comma fallbacks), then calls TMDb **`/movie/now_playing`** with `region` = that place’s **country code** (fallback `US` only if geocode has no `country_code`). Returns `{ location, region, movies }` where each movie has `title`, `release_date`, `vote_average`, and a truncated `overview`.
+
+`get_city_metrics` (see [src/tools/geocost.ts](src/tools/geocost.ts)) geocodes the `city`, and for US places resolves **state + place (or county) FIPS** via the Census Geocoder, then fetches ACS 5-year `B19013_001E` (median household income) and `B25064_001E` (median gross rent) from `api.census.gov`. The Census missing-data sentinel `-666666666` is coerced to `null`. `cost_index` is a deterministic 0–100 score weighted toward rent (`0.7 * rent/$1,300 + 0.3 * income/$75,000`, scaled ×50 and clamped); when ACS numbers are missing the tool falls back to a population-based estimate and sets `limited: true`. Non-US places always return `limited: true` with income/rent `null`.
 
 For `DECISION_REPORT` responses, [src/lib/investmentRules.ts](src/lib/investmentRules.ts) applies a deterministic rule after the model returns: if a stock’s `trend` is `"down"` **and** `volatility_score` **>** `0.7` (i.e. above 70 on a 0–100-style scale), that stock option’s score is reduced by 20 points (clamped to 0–100) and `recommendation` is set to the highest-scoring option’s `name` (stock option names should include the ticker, e.g. `"Invest TSLA"`, so the rule can match tool results).
 

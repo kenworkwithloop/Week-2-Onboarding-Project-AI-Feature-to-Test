@@ -9,6 +9,7 @@ import { geocodeFirst } from "../lib/geocoding.js";
 import { getWeather } from "../tools/weather.js";
 import { getStockData } from "../tools/stock.js";
 import { getLocalMovies } from "../tools/movies.js";
+import { getCityMetrics } from "../tools/geocost.js";
 
 const DEFAULT_MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
 /** Max chat completions in the tool loop (each can be tool_calls or final parse). */
@@ -25,7 +26,7 @@ export class ChatError extends Error {
 
 function buildSystemPrompt(): string {
   const today = new Date().toISOString().slice(0, 10);
-  return `You are a helpful assistant for weather-aware travel planning, stock quotes, and movies in theaters (by country).
+  return `You are a helpful assistant for weather-aware travel planning, stock quotes, movies in theaters (by country), and US city cost-of-living signals.
 
 Today's date is ${today} (UTC). Always use dates from today onward; never use dates from your training cutoff.
 
@@ -43,6 +44,11 @@ Tools:
   * Call when the user asks what is playing, wants cinema ideas, or indoor entertainment for a trip. Use the same city/place wording the user gave (or the itinerary city).
   * Call at most once per distinct city per user turn. Do not retry on API errors; mention them in chat.message.
   * Requires THE_MOVIE_DB_API_KEY on the server.
+- get_city_metrics(city) returns { location, country_code, population, median_household_income_usd, median_gross_rent_usd, cost_index (0-100), limited, note, data_source }. Federal open data via US Census ACS 5-year + Census Geocoder (Data.gov ecosystem).
+  * Call when the user asks about cost of living, affordability, budget sizing, or wants to compare US cities.
+  * US places return ACS income/rent plus a rent-weighted cost_index. Non-US (or missing Census data) sets limited: true and cost_index is a population-based fallback; do not invent ACS numbers for those.
+  * Call at most once per distinct city per user turn. Pass the same city/place wording the user gave.
+  * Requires CENSUS_API_KEY on the server for full US metrics; without it, limited: true.
 
 Final structured envelope (always both keys): { "response": <structured object or null>, "chat": { "message": string } }. Never omit chat; chat has only the message field (no type discriminator).
 
@@ -95,6 +101,16 @@ const GetLocalMoviesArgs = z.object({
     ),
 });
 type GetLocalMoviesArgs = z.infer<typeof GetLocalMoviesArgs>;
+
+const GetCityMetricsArgs = z.object({
+  city: z
+    .string()
+    .min(1)
+    .describe(
+      "User's city or place for cost/metrics lookup (e.g. trip destination). US places return ACS income/rent; non-US returns limited data.",
+    ),
+});
+type GetCityMetricsArgs = z.infer<typeof GetCityMetricsArgs>;
 
 let cachedClient: OpenAI | null | undefined;
 
@@ -170,6 +186,12 @@ export async function runChat(history: ChatInputMessage[]): Promise<ChatResult> 
       description:
         "The Movie Database: now-playing movies for the country of the given city/place (after geocode). Pass the user's location string.",
     }),
+    zodFunction({
+      name: "get_city_metrics",
+      parameters: GetCityMetricsArgs,
+      description:
+        "Federal open data city metrics (US Census ACS + Census Geocoder): median household income, median gross rent, and a 0-100 cost_index. US places only for full numbers; non-US returns limited data.",
+    }),
   ];
 
   const fail = (msg: string) => new ChatError(msg, toolCalls);
@@ -229,6 +251,9 @@ export async function runChat(history: ChatInputMessage[]): Promise<ChatResult> 
           } else if (call.function.name === "get_local_movies") {
             const args = call.function.parsed_arguments as GetLocalMoviesArgs;
             result = await getLocalMovies(args.city);
+          } else if (call.function.name === "get_city_metrics") {
+            const args = call.function.parsed_arguments as GetCityMetricsArgs;
+            result = await getCityMetrics(args.city);
           } else {
             throw new Error(`Unknown tool: ${call.function.name}`);
           }
