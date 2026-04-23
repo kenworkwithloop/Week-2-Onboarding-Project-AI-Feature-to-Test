@@ -12,9 +12,7 @@ import { getLocalMovies } from "../tools/movies.js";
 import { getCityMetrics } from "../tools/geocost.js";
 
 const DEFAULT_MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
-/** Max chat completions in the tool loop (each can be tool_calls or final parse). */
 const MAX_ITERS = 24;
-/** After this many completions still returning tool_calls, forbid further tools so the model must emit a final structured reply. */
 const FORCE_NO_TOOLS_AFTER_ITER = 7;
 
 export class ChatError extends Error {
@@ -43,6 +41,7 @@ Tools:
 - get_local_movies(city) returns { location, region, movies: [{ title, release_date, vote_average, overview }] }. Theatrical "now playing" for the **country** of the geocoded place (same city string the user asked about — pass that trip city or place name). Not per-theater or neighborhood precision.
   * Call when the user asks what is playing, wants cinema ideas, or indoor entertainment for a trip. Use the same city/place wording the user gave (or the itinerary city).
   * Call at most once per distinct city per user turn. Do not retry on API errors; mention them in chat.message.
+  * When you list titles in chat.message, include only movies from the tool result's movies array (exact titles; release_date and vote_average must match those rows). Do not invent films not in that array.
   * Requires THE_MOVIE_DB_API_KEY on the server.
 - get_city_metrics(city) returns { location, country_code, population, median_household_income_usd, median_gross_rent_usd, cost_index (0-100), limited, note, data_source }. Federal open data via US Census ACS 5-year + Census Geocoder (Data.gov ecosystem).
   * Call when the user asks about cost of living, affordability, budget sizing, or wants to compare US cities.
@@ -145,7 +144,6 @@ export interface ChatInputMessage {
 
 export interface ChatResult {
   output: AgentOutputT;
-  /** Always present alongside `output`: `{ message: string }`. */
   chat: ChatOutputT;
   toolCalls: ToolCall[];
 }
@@ -157,7 +155,6 @@ function toolDedupeKey(name: string, args: Record<string, unknown>): string {
 export async function runChat(history: ChatInputMessage[]): Promise<ChatResult> {
   const client = getClient();
   const toolCalls: ToolCall[] = [];
-  /** Same-turn duplicate tool+args → reuse JSON result string (stops rate-limit hammer / retry loops). */
   const toolResultByKey = new Map<string, string>();
   const messages: ChatCompletionMessageParam[] = [
     { role: "system", content: buildSystemPrompt() },
@@ -203,7 +200,6 @@ export async function runChat(history: ChatInputMessage[]): Promise<ChatResult> 
       temperature: 0.3,
       messages,
       tools,
-      // API requires `tools` whenever `tool_choice` is set; `"none"` blocks further tool calls.
       tool_choice: forceNoTools ? "none" : "auto",
       response_format: zodResponseFormat(AgentOutputEnvelope, "agent_output"),
     });

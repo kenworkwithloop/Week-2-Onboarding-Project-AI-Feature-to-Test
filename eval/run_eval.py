@@ -22,6 +22,8 @@ from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENT_TIMEOUT_SEC = 180
+# Max characters per retrieval_context string for generic JSON (movies use per-title rows).
+_RETRIEVAL_CHUNK = 7500
 
 
 def _load_env() -> None:
@@ -84,21 +86,23 @@ CASES: list[EvalCase] = [
         name="movies_now_playing_chicago",
         prompt="What movies are playing in theaters in Chicago right now?",
         expected_output=(
-            "A chat-only or lightly structured reply that lists a few current "
-            "theatrical titles for Chicago's country/region (US), grounded in the "
-            "get_local_movies tool output. Titles, release dates, or ratings "
-            "mentioned in prose must match the tool result; no invented films."
+            "Structured `output` may be null — listing movies only in "
+            "`chat.message` is valid. Every film title the assistant names must "
+            "appear exactly (same spelling) in the get_local_movies rows inside "
+            "`retrieval_context`; release dates and vote_average, if stated, must "
+            "match those rows. Plot one-liners may paraphrase tool overviews but "
+            "must not add titles absent from retrieval_context."
         ),
     ),
     EvalCase(
         name="city_metrics_austin",
         prompt="How affordable is Austin, Texas? I care about rent and income.",
         expected_output=(
-            "A chat reply that cites the get_city_metrics tool output for Austin: "
-            "median_household_income_usd, median_gross_rent_usd, and/or "
-            "cost_index from the Census ACS data. Numbers quoted in prose must "
-            "match the tool result; the reply should acknowledge `limited: true` "
-            "caveats if present rather than invent ACS figures."
+            "A chat reply grounded in get_city_metrics for Austin. If the tool "
+            "returns median_household_income_usd and/or median_gross_rent_usd, "
+            "those numbers in prose must match exactly. If those fields are null, "
+            "say so explicitly and still report cost_index, limited, and note from "
+            "the tool; do not invent ACS figures. output may be null (chat-only)."
         ),
     ),
 ]
@@ -161,20 +165,81 @@ def _format_actual_output(envelope: dict[str, Any]) -> str:
     return f"chat.message: {chat_message}\noutput: {structured_line}"
 
 
+def _dedupe_tool_calls(tool_calls: list[Any]) -> list[Any]:
+    """Drop identical tool name+args+result rows (model sometimes repeats calls)."""
+    seen: set[str] = set()
+    out: list[Any] = []
+    for call in tool_calls:
+        key = json.dumps(
+            {"name": call.get("name"), "args": call.get("args"), "result": call.get("result")},
+            sort_keys=True,
+            default=str,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(call)
+    return out
+
+
+def _chunks_for_movie_tool(name: str, args: dict[str, Any], result: Any) -> list[str]:
+    """One row per title so Faithfulness sees the full now-playing list (no mid-JSON cut)."""
+    if not isinstance(result, dict):
+        return []
+    movies = result.get("movies")
+    if not isinstance(movies, list):
+        return []
+    header = {k: v for k, v in result.items() if k != "movies"}
+    args_s = json.dumps(args, default=str, ensure_ascii=False)
+    lines = [
+        f"{name}(args={args_s}) location header: "
+        f"{json.dumps(header, default=str, ensure_ascii=False)}"
+    ]
+    for i, m in enumerate(movies):
+        if not isinstance(m, dict):
+            continue
+        row = {
+            "title": m.get("title"),
+            "release_date": m.get("release_date"),
+            "vote_average": m.get("vote_average"),
+        }
+        lines.append(f"{name} row[{i}]: {json.dumps(row, ensure_ascii=False)}")
+    return lines
+
+
+def _chunks_for_generic_tool(name: str, args: dict[str, Any], result: Any) -> list[str]:
+    """Full JSON, split across multiple retrieval_context strings if huge."""
+    args_s = json.dumps(args, default=str, ensure_ascii=False)
+    body = json.dumps(result, default=str, ensure_ascii=False)
+    prefix = f"{name}(args={args_s}) -> "
+    if len(prefix) + len(body) <= _RETRIEVAL_CHUNK:
+        return [prefix + body]
+    chunks: list[str] = []
+    step = max(4000, _RETRIEVAL_CHUNK - len(prefix) - 40)
+    for start in range(0, len(body), step):
+        part = body[start : start + step]
+        label = f"{name} result[{start}:{start + len(part)}]"
+        chunks.append(f"{label}: {part}")
+    return chunks
+
+
 def _format_retrieval_context(envelope: dict[str, Any]) -> list[str]:
-    """Turn each toolCall into a short grounding string for FaithfulnessMetric."""
-    tool_calls = envelope.get("toolCalls") or []
+    """Turn each toolCall into grounding strings for FaithfulnessMetric."""
+    tool_calls = _dedupe_tool_calls(list(envelope.get("toolCalls") or []))
     if not tool_calls:
         return ["No tool calls were made for this turn; the reply should be a plain chat response without tool-derived facts."]
 
     chunks: list[str] = []
     for call in tool_calls:
-        name = call.get("name", "<tool>")
-        args = call.get("args", {})
+        name = str(call.get("name") or "<tool>")
+        args = call.get("args") if isinstance(call.get("args"), dict) else {}
         result = call.get("result")
-        snippet = json.dumps(result, default=str, ensure_ascii=False)[:2000]
-        args_snippet = json.dumps(args, default=str, ensure_ascii=False)[:500]
-        chunks.append(f"{name}(args={args_snippet}) -> {snippet}")
+        if name == "get_local_movies":
+            movie_chunks = _chunks_for_movie_tool(name, args, result)
+            if movie_chunks:
+                chunks.extend(movie_chunks)
+                continue
+        chunks.extend(_chunks_for_generic_tool(name, args, result))
     return chunks
 
 
@@ -204,16 +269,21 @@ def build_metrics() -> list[Any]:
         name="Correctness",
         criteria=(
             "Determine whether the 'actual output' satisfies the 'expected output' "
-            "rubric for the OmniPlanner agent. Penalize: wrong envelope type "
-            "(missing or wrong 'output' schema), invented tool data, or ignoring "
-            "the user's ask. Reward: correct structured type, dates/fields/ranges "
-            "that match the rubric, and a chat.message that matches the stated "
-            "tone for the mode."
+            "rubric for the OmniPlanner agent. When 'retrieval_context' is non-empty, "
+            "use it as ground truth for tool-backed facts (movie titles/dates, "
+            "weather numbers, stock fields, Census fields). Penalize claims that "
+            "contradict retrieval_context or titles/dates not found there when the "
+            "rubric requires grounding. Penalize wrong structured 'output' type "
+            "when the rubric requires TRAVEL_ITINERARY or DECISION_REPORT. Do not "
+            "penalize 'output: null' when the expected rubric explicitly allows a "
+            "chat-only turn. Reward: schema when required, accurate tool alignment, "
+            "and chat.message tone per the rubric."
         ),
         evaluation_params=[
             LLMTestCaseParams.INPUT,
             LLMTestCaseParams.ACTUAL_OUTPUT,
             LLMTestCaseParams.EXPECTED_OUTPUT,
+            LLMTestCaseParams.RETRIEVAL_CONTEXT,
         ],
         threshold=0.5,
     )

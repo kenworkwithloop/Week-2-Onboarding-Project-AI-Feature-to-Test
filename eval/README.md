@@ -20,15 +20,42 @@ Environment variables (reuse the same `.env` as the main app — see the top-lev
 
 Export them or rely on the app's `.env` — the harness loads `../.env` automatically if present.
 
-## Run
+### Confident AI (`deepeval view`)
 
-From the repo root:
+To open the latest eval run in the browser without typing your key every time, persist **`CONFIDENT_API_KEY`** (this is separate from `OPENAI_API_KEY` — it comes from [app.confident-ai.com](https://app.confident-ai.com)):
+
+1. **Recommended:** add one line to the repo-root `.env` or `.env.local` (both are gitignored):
+
+   ```bash
+   CONFIDENT_API_KEY=confident_...
+   ```
+
+2. **Or** save it via the CLI once (from repo root, venv active or use `npm run deepeval`):
+
+   ```bash
+   npm run deepeval -- login --confident-api-key "confident_..." --save=dotenv:.env.local
+   ```
+
+DeepEval loads dotenv files from the project directory in order: `.env` → `.env.<APP_ENV>` → `.env.local` (see [environment variables](https://docs.confident-ai.com/docs/environment-variables)).
+
+Open the dashboard for the last run:
 
 ```bash
+npm run deepeval:view
+```
+
+Any other `deepeval` subcommand works the same way, e.g. `npm run deepeval -- login`.
+
+## Run
+
+From the repo root (with the venv activated):
+
+```bash
+source eval/.venv/bin/activate
 python3 eval/run_eval.py
 ```
 
-or the npm alias:
+or use the npm script, which runs **`eval/.venv`** Python via [`scripts/deepeval.cjs`](../scripts/deepeval.cjs) so you do not need `deepeval` on your global `python3`:
 
 ```bash
 npm run eval:deepeval
@@ -42,7 +69,7 @@ All DeepEval metrics return a `score` in `[0, 1]` and a natural-language `reason
 
 - **Answer Relevancy** (`AnswerRelevancyMetric`) — does the reply actually answer the user's prompt? Low scores flag prompt drift or off-topic responses.
 - **Faithfulness** (`FaithfulnessMetric`) — are the factual claims in the reply supported by the `toolCalls` results we pass as `retrieval_context`? Low scores flag hallucination beyond what the tools returned.
-- **Correctness** (`GEval`, custom rubric) — does the structured output match the per-case expectation (e.g. itinerary has days, decision report has ≥2 options, chat-only turn has `output: null`)? Low scores flag schema or content regressions the first two metrics can't catch.
+- **Correctness** (`GEval`, custom rubric) — checks each case’s rubric against `actual_output` **and** `retrieval_context` (tool ground truth), so titles, dates, and numbers can be verified against what the tools returned.
 
 ## Test cases
 
