@@ -55,6 +55,8 @@ Optional env:
 | `npm run build && npm start -- run Compare TSLA and travel to NYC` | Build, then run from `dist/` |
 | `npm run serve` | Fastify on `http://localhost:3000` with `GET /health` and `POST /chat` |
 | `npm run lint:types` | Strict `tsc --noEmit` type check |
+| `npm run test:e2e` | Playwright HTTP contract tests against `/health` and `/chat` validation (see [e2e/](e2e/)) |
+| `E2E_LIVE=1 npm run test:e2e` | Also run the live agent round-trip spec (requires `OPENAI_API_KEY`) |
 
 ## Flow
 
@@ -143,3 +145,27 @@ curl -sS http://localhost:3000/chat \
 ### `GET /health`
 
 Returns `{ "status": "ok" }`.
+
+## End-to-end tests (Playwright)
+
+The [e2e/](e2e/) folder contains Playwright HTTP tests that exercise the live Fastify server (no browser DOM — this is an API-only service). The Playwright `webServer` block in [`playwright.config.ts`](playwright.config.ts) starts the app on port `4173` and waits for `/health` before running the suite.
+
+One-time setup (downloads the browser used as Playwright's HTTP runtime):
+
+```bash
+npx playwright install chromium
+```
+
+Run the deterministic contract tests (no OpenAI calls, no API keys needed):
+
+```bash
+npm run test:e2e
+```
+
+Include the live agent round-trip (uses tokens; requires `OPENAI_API_KEY` in `.env`):
+
+```bash
+E2E_LIVE=1 npm run test:e2e
+```
+
+The specs are split by concern: [`e2e/health.spec.ts`](e2e/health.spec.ts) covers `GET /health`, [`e2e/chat-validation.spec.ts`](e2e/chat-validation.spec.ts) covers the `POST /chat` 400 paths from `validateMessages` in [`src/server.ts`](src/server.ts), and [`e2e/chat-agent-live.spec.ts`](e2e/chat-agent-live.spec.ts) is gated behind `E2E_LIVE=1`.
