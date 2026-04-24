@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -20,10 +21,17 @@ from deepeval import evaluate
 from deepeval.metrics import AnswerRelevancyMetric, FaithfulnessMetric, GEval
 from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 
+from observability import append_jsonl, traces_to_csv
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
+LOGS_DIR = REPO_ROOT / "logs"
 AGENT_TIMEOUT_SEC = 180
 # Max characters per retrieval_context string for generic JSON (movies use per-title rows).
 _RETRIEVAL_CHUNK = 7500
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _load_env() -> None:
@@ -296,8 +304,10 @@ def _format_retrieval_context(envelope: dict[str, Any]) -> list[str]:
     return chunks
 
 
-def build_test_cases() -> list[LLMTestCase]:
+def build_test_cases_and_traces() -> tuple[list[LLMTestCase], list[dict[str, Any]]]:
+    """Run the agent once per case, returning DeepEval cases and trace rows."""
     test_cases: list[LLMTestCase] = []
+    traces: list[dict[str, Any]] = []
     for case in CASES:
         print(f"[agent] running case: {case.name} -> {case.prompt!r}", flush=True)
         envelope = run_agent(case.prompt)
@@ -312,7 +322,21 @@ def build_test_cases() -> list[LLMTestCase]:
                 retrieval_context=context,
             )
         )
-    return test_cases
+        traces.append(
+            {
+                "case_name": case.name,
+                "prompt": case.prompt,
+                "model_output": actual,
+                "agent_ok": bool(envelope.get("ok", False)),
+                "agent_error": envelope.get("error"),
+                "tool_calls": [
+                    call.get("name") for call in (envelope.get("toolCalls") or [])
+                    if isinstance(call, dict) and call.get("name")
+                ],
+                "agent_completed_at": _utc_now_iso(),
+            }
+        )
+    return test_cases, traces
 
 
 def build_metrics() -> list[Any]:
@@ -343,16 +367,65 @@ def build_metrics() -> list[Any]:
     return [relevancy, faithfulness, correctness]
 
 
+def _scores_from_result(result: Any) -> dict[str, dict[str, dict[str, Any]]]:
+    """Index evaluate()'s TestResult list by case name -> { metric: {score, ...} }."""
+    indexed: dict[str, dict[str, dict[str, Any]]] = {}
+    for test_result in getattr(result, "test_results", []) or []:
+        name = getattr(test_result, "name", None)
+        if not name:
+            continue
+        per_metric: dict[str, dict[str, Any]] = {}
+        for metric in getattr(test_result, "metrics_data", None) or []:
+            per_metric[metric.name] = {
+                "score": metric.score,
+                "threshold": metric.threshold,
+                "success": metric.success,
+                "reason": metric.reason,
+                "error": metric.error,
+            }
+        indexed[name] = per_metric
+    return indexed
+
+
+def _aggregate_score(per_metric: dict[str, dict[str, Any]]) -> float | None:
+    """Mean of non-null metric scores; None if no scores exist."""
+    values = [m["score"] for m in per_metric.values() if isinstance(m.get("score"), (int, float))]
+    return round(sum(values) / len(values), 4) if values else None
+
+
+def _write_observability_log(traces: list[dict[str, Any]], run_id: str) -> Path:
+    jsonl_path = LOGS_DIR / f"eval_observability_{run_id}.jsonl"
+    csv_path = LOGS_DIR / f"eval_observability_{run_id}.csv"
+    append_jsonl(jsonl_path, traces)
+    traces_to_csv(csv_path, traces)
+    print(f"\n[observability] wrote {len(traces)} trace rows")
+    print(f"  json: {jsonl_path}")
+    print(f"   csv: {csv_path}")
+    return jsonl_path
+
+
 def main() -> int:
     _load_env()
     if not os.environ.get("OPENAI_API_KEY"):
         print("error: OPENAI_API_KEY is required for both the agent and DeepEval judges.", file=sys.stderr)
         return 2
 
-    test_cases = build_test_cases()
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    test_cases, traces = build_test_cases_and_traces()
     metrics = build_metrics()
     print(f"\n[deepeval] scoring {len(test_cases)} test cases with {len(metrics)} metrics...\n", flush=True)
-    evaluate(test_cases=test_cases, metrics=metrics)
+    result = evaluate(test_cases=test_cases, metrics=metrics)
+
+    scores_by_case = _scores_from_result(result)
+    eval_completed_at = _utc_now_iso()
+    for trace in traces:
+        scores = scores_by_case.get(trace["case_name"], {})
+        trace["scores"] = scores
+        trace["aggregate_score"] = _aggregate_score(scores)
+        trace["eval_completed_at"] = eval_completed_at
+        trace["run_id"] = run_id
+
+    _write_observability_log(traces, run_id)
     return 0
 
 
