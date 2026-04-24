@@ -2,6 +2,15 @@
 
 A weather-aware travel chatbot with a stock-quote side hustle, a **movies in theaters** tool, and a **US city cost-of-living** tool. You send a conversation (`messages[]`) and the LLM may call `get_weather`, `get_stock_data`, `get_local_movies`, or `get_city_metrics`, then returns **always** `chat: { "message": "..." }` plus **`output`**: a `TRAVEL_ITINERARY`, a `DECISION_REPORT`, or **`null`** on chat-only turns. All responses are validated with Zod. A working network and a valid `OPENAI_API_KEY` are required.
 
+## Quick start
+
+1. `npm install`, then `cp .env.example .env` and set at least `OPENAI_API_KEY`.
+2. **API:** `npm run serve` → [http://localhost:3000](http://localhost:3000) (`GET /health`, `POST /chat`).
+3. **CLI:** `npm run dev -- run your message here`.
+4. **DeepEval:** once, from `eval/`: `python3 -m venv .venv` then `.venv/bin/pip install -r requirements.txt` (Windows: `.venv\Scripts\pip`). From repo root: `npm run eval:deepeval`; `npm run deepeval:view` opens the Confident AI dashboard for the last run. See [eval/README.md](eval/README.md).
+
+More env vars and commands are in **Setup** and **Common commands** below.
+
 ## Stack
 
 - **Node 20+**, TypeScript, ESM, [Zod](https://zod.dev) for output validation
