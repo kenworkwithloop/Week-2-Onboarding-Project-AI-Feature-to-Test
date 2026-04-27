@@ -52,16 +52,29 @@ From the repo root (with the venv activated):
 
 ```bash
 source eval/.venv/bin/activate
-python3 eval/run_eval.py
+python3 eval/agent_pipeline.py
 ```
 
-or use the npm script, which runs **`eval/.venv`** Python via [`scripts/deepeval.cjs`](../scripts/deepeval.cjs) so you do not need `deepeval` on your global `python3`:
+or use the npm script, which runs **`eval/.venv`** Python via [`scripts/eval-pipeline.cjs`](../scripts/eval-pipeline.cjs) so you do not need `deepeval` on your global `python3`:
 
 ```bash
-npm run eval:deepeval
+npm run eval:pipeline
 ```
 
-Expect roughly 5–15 minutes: each of the 10 cases runs the agent once and then runs three LLM-as-judge metrics against it.
+`npm run eval:deepeval` is kept as an alias for the same pipeline.
+
+Expect roughly 5–15 minutes: each case runs the agent once and then runs three LLM-as-judge metrics against it.
+
+### Pipeline phases
+
+The single command runs four phases in order, with phase headers in the console:
+
+1. **Generate test inputs** — [`generate_eval_cases`](agent_pipeline.py) writes `eval/generated/<run_id>_cases.json` (curated baseline from [`cases.py`](cases.py) plus a couple of parameterized variants). Pass `--cases path.json` to skip generation and replay a prior artifact.
+2. **Run agent** — invokes the OmniPlanner CLI once per case via [`run_agent`](run_eval.py).
+3. **Evaluate** — DeepEval scores each case with Answer Relevancy, Faithfulness, and a G-Eval Correctness rubric.
+4. **Log** — writes `logs/eval_observability_<run_id>.jsonl` and `.csv`, then prints a per-case score table and metric means.
+
+Add `--verbose` for full prompts and per-case debug lines.
 
 ## Metrics
 
@@ -73,7 +86,7 @@ All DeepEval metrics return a `score` in `[0, 1]` and a natural-language `reason
 
 ## Test cases
 
-Ten prompts covering the agent's main modes, defined in [`run_eval.py`](run_eval.py):
+Curated prompts covering the agent's main modes, defined in [`cases.py`](cases.py):
 
 1. Chat-only greeting (expects `output: null`).
 2. Travel itinerary for a US city (expects `TRAVEL_ITINERARY` with `days[]`).

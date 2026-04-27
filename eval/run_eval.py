@@ -12,7 +12,6 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +20,7 @@ from deepeval import evaluate
 from deepeval.metrics import AnswerRelevancyMetric, FaithfulnessMetric, GEval
 from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 
+from cases import CASES, EvalCase
 from observability import append_jsonl, traces_to_csv
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -47,126 +47,6 @@ def _load_env() -> None:
         key = key.strip()
         value = value.strip().strip('"').strip("'")
         os.environ.setdefault(key, value)
-
-
-@dataclass(frozen=True)
-class EvalCase:
-    name: str
-    prompt: str
-    expected_output: str
-
-
-CASES: list[EvalCase] = [
-    EvalCase(
-        name="chat_only_greeting",
-        prompt="Hi there, what can you help me with?",
-        expected_output=(
-            "A friendly 1-3 sentence greeting that briefly lists what the assistant "
-            "can help with (travel planning, stock snapshots, movies in theaters, "
-            "US city cost signals). The structured output must be null because this "
-            "is a chat-only turn."
-        ),
-    ),
-    EvalCase(
-        name="travel_itinerary_seattle",
-        prompt="Plan a 3-day weekend trip to Seattle starting this Friday.",
-        expected_output=(
-            "A TRAVEL_ITINERARY with location referencing Seattle, exactly 3 "
-            "entries in days[] with ISO YYYY-MM-DD dates in sequence, a positive "
-            "integer budget_estimate, and risk_flags that only contain 'rain' if "
-            "a weather tool call actually reported rain_probability >= 0.6. The "
-            "chat.message should be a short intro or wrap-up, not a day list."
-        ),
-    ),
-    EvalCase(
-        name="decision_report_tsla_vs_travel",
-        prompt="Should I invest $1000 in TSLA or take a weekend trip to New York City?",
-        expected_output=(
-            "A DECISION_REPORT with at least two options (one whose name contains "
-            "'TSLA', one referencing NYC travel), integer scores in [0, 100], and "
-            "a recommendation that exactly matches one of the option names. "
-            "chat.message should cite concrete tool facts like price, trend, "
-            "volatility_score, temperature, or rain_probability and briefly "
-            "explain the tradeoff."
-        ),
-    ),
-    EvalCase(
-        name="movies_now_playing_chicago",
-        prompt="What movies are playing in theaters in Chicago right now?",
-        expected_output=(
-            "Structured `output` may be null — listing movies only in "
-            "`chat.message` is valid. Every film title the assistant names must "
-            "appear exactly (same spelling) in the get_local_movies rows inside "
-            "`retrieval_context`; release dates and vote_average, if stated, must "
-            "match those rows. Plot one-liners may paraphrase tool overviews but "
-            "must not add titles absent from retrieval_context."
-        ),
-    ),
-    EvalCase(
-        name="city_metrics_austin",
-        prompt="How affordable is Austin, Texas? I care about rent and income.",
-        expected_output=(
-            "A chat reply grounded in get_city_metrics for Austin. If the tool "
-            "returns median_household_income_usd and/or median_gross_rent_usd, "
-            "those numbers in prose must match exactly. If those fields are null, "
-            "say so explicitly and still report cost_index, limited, and note from "
-            "the tool; do not invent ACS figures. output may be null (chat-only)."
-        ),
-    ),
-    EvalCase(
-        name="weather_forecast_boston",
-        prompt="What will the weather be like in Boston tomorrow?",
-        expected_output=(
-            "A helpful reply grounded in get_weather for Boston for a single future "
-            "calendar day (tomorrow). Any temperature, rain_probability, or "
-            "conditions stated in chat.message must match the tool result in "
-            "retrieval_context. output may be null (chat-only)."
-        ),
-    ),
-    EvalCase(
-        name="stock_quote_msft",
-        prompt="What is Microsoft's stock price and trend right now?",
-        expected_output=(
-            "A reply grounded in get_stock_data for MSFT (symbol MSFT). "
-            "chat.message should cite price, trend, and/or volatility_score from "
-            "the tool; those values must match retrieval_context. output may be "
-            "null (chat-only)."
-        ),
-    ),
-    EvalCase(
-        name="decision_aapl_vs_msft",
-        prompt="Should I invest in AAPL or MSFT for the next quarter?",
-        expected_output=(
-            "A DECISION_REPORT with at least two options whose names include "
-            "both 'AAPL' and 'MSFT' (or clear Apple vs Microsoft labels tied to "
-            "those tickers), integer scores in [0, 100], and recommendation "
-            "exactly matching one option name. chat.message should cite concrete "
-            "get_stock_data facts for each ticker (price, trend, volatility_score). "
-            "Both tickers should have been retrieved before scoring."
-        ),
-    ),
-    EvalCase(
-        name="movies_now_playing_london",
-        prompt="What movies are playing in theaters in London right now?",
-        expected_output=(
-            "Structured output may be null. Listings in chat.message must be "
-            "grounded in get_local_movies for London: every title must appear in "
-            "retrieval_context rows; release_date and vote_average must match if "
-            "quoted. Region should reflect the UK theatrical market from the tool."
-        ),
-    ),
-    EvalCase(
-        name="city_compare_denver_phoenix",
-        prompt="Compare cost of living between Denver and Phoenix for a potential move.",
-        expected_output=(
-            "A reply that compares the two cities using get_city_metrics results "
-            "for Denver and Phoenix (two tool calls or one per city). Any "
-            "cost_index, income, rent, population, limited, or note values "
-            "mentioned must match the corresponding retrieval_context payloads; "
-            "do not invent Census figures. output may be null (chat-only)."
-        ),
-    ),
-]
 
 
 def _pick_runner() -> list[str]:
@@ -304,13 +184,29 @@ def _format_retrieval_context(envelope: dict[str, Any]) -> list[str]:
     return chunks
 
 
-def build_test_cases_and_traces() -> tuple[list[LLMTestCase], list[dict[str, Any]]]:
+def build_test_cases_and_traces(
+    cases: list[EvalCase] | None = None,
+    *,
+    verbose: bool = False,
+) -> tuple[list[LLMTestCase], list[dict[str, Any]]]:
     """Run the agent once per case, returning DeepEval cases and trace rows."""
+    case_list = list(cases) if cases is not None else CASES
     test_cases: list[LLMTestCase] = []
     traces: list[dict[str, Any]] = []
-    for case in CASES:
-        print(f"[agent] running case: {case.name} -> {case.prompt!r}", flush=True)
+    total = len(case_list)
+    width = max(len(c.name) for c in case_list) if case_list else 0
+    for idx, case in enumerate(case_list, start=1):
+        if verbose:
+            print(f"[agent] ({idx}/{total}) {case.name} -> {case.prompt!r}", flush=True)
+        else:
+            print(f"  [{idx:>2}/{total}] {case.name:<{width}}  ...", end="", flush=True)
+        started = datetime.now(timezone.utc)
         envelope = run_agent(case.prompt)
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        ok = bool(envelope.get("ok", False))
+        if not verbose:
+            status = "ok" if ok else "fail"
+            print(f" {status} ({elapsed:0.1f}s)", flush=True)
         actual = _format_actual_output(envelope)
         context = _format_retrieval_context(envelope)
         test_cases.append(
@@ -327,8 +223,9 @@ def build_test_cases_and_traces() -> tuple[list[LLMTestCase], list[dict[str, Any
                 "case_name": case.name,
                 "prompt": case.prompt,
                 "model_output": actual,
-                "agent_ok": bool(envelope.get("ok", False)),
+                "agent_ok": ok,
                 "agent_error": envelope.get("error"),
+                "agent_elapsed_sec": round(elapsed, 3),
                 "tool_calls": [
                     call.get("name") for call in (envelope.get("toolCalls") or [])
                     if isinstance(call, dict) and call.get("name")
@@ -405,28 +302,10 @@ def _write_observability_log(traces: list[dict[str, Any]], run_id: str) -> Path:
 
 
 def main() -> int:
-    _load_env()
-    if not os.environ.get("OPENAI_API_KEY"):
-        print("error: OPENAI_API_KEY is required for both the agent and DeepEval judges.", file=sys.stderr)
-        return 2
+    """Backwards-compatible entrypoint: delegate to the full pipeline."""
+    from agent_pipeline import main as pipeline_main
 
-    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    test_cases, traces = build_test_cases_and_traces()
-    metrics = build_metrics()
-    print(f"\n[deepeval] scoring {len(test_cases)} test cases with {len(metrics)} metrics...\n", flush=True)
-    result = evaluate(test_cases=test_cases, metrics=metrics)
-
-    scores_by_case = _scores_from_result(result)
-    eval_completed_at = _utc_now_iso()
-    for trace in traces:
-        scores = scores_by_case.get(trace["case_name"], {})
-        trace["scores"] = scores
-        trace["aggregate_score"] = _aggregate_score(scores)
-        trace["eval_completed_at"] = eval_completed_at
-        trace["run_id"] = run_id
-
-    _write_observability_log(traces, run_id)
-    return 0
+    return pipeline_main([])
 
 
 if __name__ == "__main__":
